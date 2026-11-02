@@ -5,6 +5,8 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <dlfcn.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 // ---------------------------------------------------------------- constants
 static const CGFloat kIslandW = 126.0;
@@ -210,8 +212,9 @@ static UIView *IDFindIcon(UIView *root) {
                 CGRect f = [s convertRect:s.bounds toView:root];
                 BOOL square = fabs(f.size.width - f.size.height) < 2.0;
                 if (square && f.size.width >= 20.0 && f.size.width <= 52.0 && !IDContainsLabel(s)) {
-                    if (f.origin.x < bestX) {
-                        bestX = f.origin.x;
+                    CGFloat score = f.origin.x + ((f.size.width >= 30.0) ? 0.0 : 1000.0);
+                    if (score < bestX) {
+                        bestX = score;
                         best = s;
                     }
                 }
@@ -239,6 +242,89 @@ static NSString *IDPickRow(NSMutableArray *rest) {
     return best[@"t"];
 }
 
+// ---------------------------------------------------------------- dark / light detection
+typedef void (*IDRenderDisplayFn)(uint32_t, CFStringRef, IOSurfaceRef, int, int);
+
+static NSString *const kIDCapturingPath = @"/var/mobile/Library/Preferences/com.mody.islanddrop.capturing";
+static NSString *const kIDNoCapturePath = @"/var/mobile/Library/Preferences/com.mody.islanddrop.nocapture";
+
+// returns 1 = dark, 0 = light, -1 = unknown
+static int IDDetectDark(UIScreen *screen) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:kIDNoCapturePath]) return -1;
+
+    static IDRenderDisplayFn fn = NULL;
+    static BOOL resolved = NO;
+    if (!resolved) {
+        resolved = YES;
+        fn = (IDRenderDisplayFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+    }
+    if (!fn) return -1;
+
+    CGRect nb = screen.nativeBounds;
+    CGRect sb = screen.bounds;
+    int pw = (int)nb.size.width;
+    int ph = (int)nb.size.height;
+    if (pw < 100 || ph < 100 || sb.size.width < 100.0 || sb.size.height < 100.0) return -1;
+
+    NSDictionary *props = @{
+        (__bridge id)kIOSurfaceWidth: @(pw),
+        (__bridge id)kIOSurfaceHeight: @(ph),
+        (__bridge id)kIOSurfaceBytesPerElement: @4,
+        (__bridge id)kIOSurfacePixelFormat: @(0x42475241)
+    };
+    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!surf) return -1;
+
+    // crash marker: if SpringBoard dies inside the capture, next launch disables capturing
+    [fm createFileAtPath:kIDCapturingPath contents:[NSData data] attributes:nil];
+    fn(0, CFSTR("LCD"), surf, 0, 0);
+    [fm removeItemAtPath:kIDCapturingPath error:nil];
+
+    int result = -1;
+    if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) == 0) {
+        const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surf);
+        size_t stride = IOSurfaceGetBytesPerRow(surf);
+        if (base && stride >= (size_t)pw * 4) {
+            const CGFloat sx = (CGFloat)pw / sb.size.width;
+            const CGFloat sy = (CGFloat)ph / sb.size.height;
+            int hist[256];
+            memset(hist, 0, sizeof(hist));
+            int count = 0;
+            BOOL anyData = NO;
+            for (int side = 0; side < 2; side++) {
+                CGFloat xStart = (side == 0) ? 8.0 : (sb.size.width - 96.0);
+                for (CGFloat x = xStart; x < xStart + 88.0; x += 3.0) {
+                    for (CGFloat y = 6.0; y < 26.0; y += 3.0) {
+                        int ix = (int)(x * sx);
+                        int iy = (int)(y * sy);
+                        if (ix < 0 || ix >= pw || iy < 0 || iy >= ph) continue;
+                        const uint8_t *px = base + (size_t)iy * stride + (size_t)ix * 4;
+                        if (px[0] || px[1] || px[2] || px[3]) anyData = YES;
+                        int lum = (int)(0.114 * px[0] + 0.587 * px[1] + 0.299 * px[2]);
+                        if (lum < 0) lum = 0;
+                        if (lum > 255) lum = 255;
+                        hist[lum]++;
+                        count++;
+                    }
+                }
+            }
+            if (anyData && count > 20) {
+                int acc = 0;
+                int median = 0;
+                for (int i = 0; i < 256; i++) {
+                    acc += hist[i];
+                    if (acc * 2 >= count) { median = i; break; }
+                }
+                result = (median < 115) ? 1 : 0;
+            }
+        }
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    }
+    CFRelease(surf);
+    return result;
+}
+
 // ---------------------------------------------------------------- overlay window
 @interface IDOverlayWindow : UIWindow
 @end
@@ -259,7 +345,8 @@ static CGColorSpaceRef gCS = NULL;
     IDSpring _drop, _expand, _reveal, _tint;
     CGFloat _scale;
     CFTimeInterval _startTime, _lastTime, _exitTime;
-    BOOL _exiting, _finished, _gotTitle, _gotIcon;
+    BOOL _exiting, _finished, _gotTitle, _dark;
+    float _cardR, _cardG, _cardB;
     CGFloat _topSeen, _origAlpha;
     CADisplayLink *_link;
     IDOverlayWindow *_window;
@@ -268,6 +355,7 @@ static CGColorSpaceRef gCS = NULL;
     CALayer *_goo;
     UIView *_content;
     UIView *_iconHolder;
+    UIImageView *_iconView;
     UILabel *_titleLabel;
     UILabel *_bodyLabel;
     CAShapeLayer *_contentMask;
@@ -321,6 +409,12 @@ static IDSession *gSession = nil;
     _reveal.target = 1.0;
     _reveal.startAt = _startTime + kEnterRevealDelay;
 
+    // dark / light detection (before our overlay is visible)
+    _dark = (IDDetectDark(screen) == 1);
+    _cardR = _dark ? (28.0f / 255.0f) : 1.0f;
+    _cardG = _dark ? (28.0f / 255.0f) : 1.0f;
+    _cardB = _dark ? (30.0f / 255.0f) : 1.0f;
+
     // overlay window
     UIWindowScene *scene = bw.windowScene;
     if (scene) {
@@ -346,6 +440,8 @@ static IDSession *gSession = nil;
     _shadow.shadowOffset = CGSizeMake(0, kShadowDY);
     _shadow.shadowRadius = kShadowBlur / 2.0;
     _shadow.shadowOpacity = 0.0;
+    _shadow.lineWidth = 1.0;
+    _shadow.strokeColor = NULL;
     [_root.layer addSublayer:_shadow];
 
     _goo = [CALayer layer];
@@ -361,17 +457,18 @@ static IDSession *gSession = nil;
     _content.layer.mask = _contentMask;
 
     _iconHolder = [[UIView alloc] initWithFrame:CGRectMake(13.0, (_L.cardH - 46.0) / 2.0, 46.0, 46.0)];
-    _iconHolder.backgroundColor = [UIColor colorWithRed:232.0 / 255.0 green:233.0 / 255.0 blue:235.0 / 255.0 alpha:1.0];
-    _iconHolder.layer.cornerRadius = 10.5;
-    _iconHolder.layer.cornerCurve = kCACornerCurveContinuous;
-    _iconHolder.layer.masksToBounds = YES;
+    _iconHolder.backgroundColor = [UIColor clearColor];
+    _iconHolder.layer.masksToBounds = NO;
     [_content addSubview:_iconHolder];
+    _iconView = [[UIImageView alloc] initWithFrame:_iconHolder.bounds];
+    _iconView.contentMode = UIViewContentModeScaleToFill;
+    [_iconHolder addSubview:_iconView];
 
     CGFloat textX = 13.0 + 46.0 + 12.0;
     CGFloat textW = _L.cardW - textX - 20.0;
     _titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(textX, 17.0, textW, 21.0)];
     _titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightBold];
-    _titleLabel.textColor = [UIColor colorWithRed:17.0 / 255.0 green:17.0 / 255.0 blue:20.0 / 255.0 alpha:1.0];
+    _titleLabel.textColor = _dark ? [UIColor whiteColor] : [UIColor colorWithRed:17.0 / 255.0 green:17.0 / 255.0 blue:20.0 / 255.0 alpha:1.0];
     _titleLabel.textAlignment = NSTextAlignmentNatural;
     _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     _titleLabel.numberOfLines = 1;
@@ -379,7 +476,7 @@ static IDSession *gSession = nil;
 
     _bodyLabel = [[UILabel alloc] initWithFrame:CGRectMake(textX, 39.0, textW, 18.0)];
     _bodyLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
-    _bodyLabel.textColor = [UIColor colorWithRed:119.0 / 255.0 green:120.0 / 255.0 blue:125.0 / 255.0 alpha:1.0];
+    _bodyLabel.textColor = _dark ? [UIColor colorWithRed:174.0 / 255.0 green:174.0 / 255.0 blue:178.0 / 255.0 alpha:1.0] : [UIColor colorWithRed:119.0 / 255.0 green:120.0 / 255.0 blue:125.0 / 255.0 alpha:1.0];
     _bodyLabel.textAlignment = NSTextAlignmentNatural;
     _bodyLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     _bodyLabel.numberOfLines = 1;
@@ -398,9 +495,12 @@ static IDSession *gSession = nil;
     _window.hidden = NO;
 
     __weak IDSession *ws = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [ws captureContent];
-    });
+    double delays[3] = { 0.12, 0.40, 0.90 };
+    for (int i = 0; i < 3; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [ws captureContent];
+        });
+    }
 
     _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
     [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -432,15 +532,23 @@ static IDSession *gSession = nil;
         }
     }
 
-    if (!_gotIcon) {
-        UIView *icon = IDFindIcon(src);
-        if (icon) {
-            UIView *snap = [icon snapshotViewAfterScreenUpdates:YES];
-            if (snap) {
-                snap.frame = _iconHolder.bounds;
-                [_iconHolder addSubview:snap];
-                _gotIcon = YES;
-            }
+    UIView *icon = IDFindIcon(src);
+    if (icon && icon.bounds.size.width > 1.0 && icon.bounds.size.height > 1.0) {
+        CGSize sz = icon.bounds.size;
+        CGFloat p = sz.width * 0.15;
+        CGSize canvas = CGSizeMake(sz.width + p * 2.0, sz.height + p * 2.0);
+        UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+        fmt.opaque = NO;
+        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:canvas format:fmt];
+        UIImage *img = [renderer imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+            CGContextTranslateCTM(rc.CGContext, p, p);
+            [icon.layer renderInContext:rc.CGContext];
+        }];
+        if (img) {
+            CGFloat k = 46.0 / sz.width;
+            CGFloat pp = p * k;
+            _iconView.frame = CGRectMake(-pp, -pp, 46.0 + pp * 2.0, 46.0 * (sz.height / sz.width) + pp * 2.0);
+            _iconView.image = img;
         }
     }
 }
@@ -515,6 +623,9 @@ static IDSession *gSession = nil;
     _shadow.path = cardPath.CGPath;
     _shadow.shadowPath = cardPath.CGPath;
     _shadow.shadowOpacity = (float)g.shadowOpacity;
+    if (_dark) {
+        _shadow.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.16 * g.shadowOpacity].CGColor;
+    }
 
     CGFloat progress = IDClamp(_reveal.value, 0.0, 1.0);
     CGFloat overshoot = IDClamp(g.widthRatio - 1.0, 0.0, 0.2);
@@ -578,6 +689,9 @@ static IDSession *gSession = nil;
 
     const float tintT = (float)IDClamp((_tint.value - kTintStart) / (kTintEnd - kTintStart), 0.0, 1.0);
     const float invK2 = 1.0f / (2.0f * kGooColorK);
+    const float cardR = _cardR;
+    const float cardG = _cardG;
+    const float cardB = _cardB;
     const float x0 = (float)minX;
     const float y0 = (float)minY;
 
@@ -600,12 +714,11 @@ static IDSession *gSession = nil;
             float t = 0.5f + (dB - dC) * invK2;
             if (t < 0.0f) t = 0.0f;
             if (t > 1.0f) t = 1.0f;
-            const float gray = t * tintT;
+            const float w = t * tintT * cov * 255.0f;
             uint8_t *p = row + (size_t)px * 4;
-            const uint8_t c = (uint8_t)(gray * cov * 255.0f + 0.5f);
-            p[0] = c;
-            p[1] = c;
-            p[2] = c;
+            p[0] = (uint8_t)(w * cardR + 0.5f);
+            p[1] = (uint8_t)(w * cardG + 0.5f);
+            p[2] = (uint8_t)(w * cardB + 0.5f);
             p[3] = (uint8_t)(cov * 255.0f + 0.5f);
         }
     }
@@ -686,6 +799,11 @@ static void IDHandleDisappear(UIView *v) {
     @autoreleasepool {
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         if (![bid isEqualToString:@"com.apple.springboard"]) return;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:kIDCapturingPath]) {
+            [fm createFileAtPath:kIDNoCapturePath contents:[NSData data] attributes:nil];
+            [fm removeItemAtPath:kIDCapturingPath error:nil];
+        }
         gShortLookClass = (Class)objc_getClass("NCNotificationShortLookView");
         if (!gShortLookClass) return;
         %init;
