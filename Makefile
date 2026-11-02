@@ -12,3 +12,6 @@ IslandDrop_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 IslandDrop_FRAMEWORKS = UIKit QuartzCore CoreGraphics IOSurface
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+SUBPROJECTS += islanddroppref
+include $(THEOS_MAKE_PATH)/aggregate.mk
