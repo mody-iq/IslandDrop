@@ -267,7 +267,7 @@ static NSString *IDPickRow(NSMutableArray *rest) {
     return best[@"t"];
 }
 
-// ---------------------------------------------------------------- accent color from icon
+// ---------------------------------------------------------------- accent color from icon (UPDATED)
 static UIColor *IDAccentFromImage(UIImage *img) {
     if (!img.CGImage) return nil;
     const int N = 16;
@@ -283,6 +283,8 @@ static UIColor *IDAccentFromImage(UIImage *img) {
     CGContextRelease(ctx);
 
     double sr = 0.0, sg = 0.0, sb = 0.0, sw = 0.0;
+    
+    // Pass 1: Look for highly saturated colors (Blue, Green, Red, etc.)
     for (int i = 0; i < N * N; i++) {
         double a = buf[i * 4 + 3] / 255.0;
         if (a < 0.5) continue;
@@ -293,13 +295,34 @@ static UIColor *IDAccentFromImage(UIImage *img) {
         double mn = MIN(r, MIN(g, b));
         double sat = (mx > 0.001) ? ((mx - mn) / mx) : 0.0;
         double w = sat * sat * mx;
-        sr += r * w;
-        sg += g * w;
-        sb += b * w;
-        sw += w;
+        sr += r * w; sg += g * w; sb += b * w; sw += w;
     }
-    if (sw < 0.5) return nil;
-    return [UIColor colorWithRed:sr / sw green:sg / sw blue:sb / sw alpha:1.0];
+    if (sw >= 0.5) return [UIColor colorWithRed:sr / sw green:sg / sw blue:sb / sw alpha:1.0];
+
+    // Pass 2: Fallback for grayscale/white icons (Settings, Messages, etc.)
+    sr = 0.0; sg = 0.0; sb = 0.0; sw = 0.0;
+    for (int i = 0; i < N * N; i++) {
+        double a = buf[i * 4 + 3] / 255.0;
+        if (a < 0.5) continue;
+        double r = MIN(1.0, (buf[i * 4] / 255.0) / a);
+        double g = MIN(1.0, (buf[i * 4 + 1] / 255.0) / a);
+        double b = MIN(1.0, (buf[i * 4 + 2] / 255.0) / a);
+        
+        // Ignore pure white and pure black to find the actual icon graphics
+        if (r > 0.9 && g > 0.9 && b > 0.9) continue; 
+        if (r < 0.1 && g < 0.1 && b < 0.1) continue;
+
+        sr += r; sg += g; sb += b; sw += 1.0;
+    }
+    if (sw > 0.5) {
+        UIColor *c = [UIColor colorWithRed:sr / sw green:sg / sw blue:sb / sw alpha:1.0];
+        CGFloat hue, sat, bright, alpha;
+        [c getHue:&hue saturation:&sat brightness:&bright alpha:&alpha];
+        if (bright < 0.4) bright = 0.5; // Boost brightness for a nicer glow
+        return [UIColor colorWithHue:hue saturation:sat brightness:bright alpha:1.0];
+    }
+    
+    return nil;
 }
 
 // ---------------------------------------------------------------- dark / light detection
@@ -336,7 +359,6 @@ static int IDDetectDark(UIScreen *screen) {
     IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     if (!surf) return -1;
 
-    // crash marker: if SpringBoard dies inside the capture, next launch disables capturing
     [fm createFileAtPath:kIDCapturingPath contents:[NSData data] attributes:nil];
     fn(0, CFSTR("LCD"), surf, 0, 0);
     [fm removeItemAtPath:kIDCapturingPath error:nil];
@@ -652,6 +674,7 @@ static IDSession *gSession = nil;
             CGFloat pp = p * k;
             _iconView.frame = CGRectMake(-pp, -pp, 46.0 + pp * 2.0, 46.0 * (sz.height / sz.width) + pp * 2.0);
             _iconView.image = img;
+            // Extract the color whenever the icon is found
             if (_glowOn) _accent = IDAccentFromImage(img);
         }
     }
@@ -727,6 +750,8 @@ static IDSession *gSession = nil;
     _shadow.path = cardPath.CGPath;
     _shadow.shadowPath = cardPath.CGPath;
     _shadow.shadowOpacity = (float)g.shadowOpacity;
+    
+    // UPDATED GLOW LOGIC HERE
     BOOL glowing = (_glowOn && _accent != nil);
     if (glowing) {
         _glow.path = cardPath.CGPath;
@@ -734,9 +759,25 @@ static IDSession *gSession = nil;
         _glow.strokeColor = [_accent colorWithAlphaComponent:0.9 * g.shadowOpacity].CGColor;
         _glow.shadowColor = _accent.CGColor;
         _glow.shadowOpacity = (float)(0.65 * g.shadowOpacity);
+        
+        // Make the main shadow (drop shadow) use the app's accent color instead of black!
+        _shadow.shadowColor = _accent.CGColor;
+        _shadow.shadowOpacity = (float)(0.5 * g.shadowOpacity); // Slightly lower opacity for the main shadow
+        
         _shadow.strokeColor = NULL;
-    } else if (_dark) {
-        _shadow.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.16 * g.shadowOpacity].CGColor;
+    } else {
+        // Default dark shadow
+        _glow.shadowOpacity = 0.0;
+        _glow.strokeColor = NULL;
+        
+        _shadow.shadowColor = [UIColor colorWithRed:16.0 / 255.0 green:19.0 / 255.0 blue:28.0 / 255.0 alpha:0.20].CGColor;
+        _shadow.shadowOpacity = (float)g.shadowOpacity;
+        
+        if (_dark) {
+            _shadow.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.16 * g.shadowOpacity].CGColor;
+        } else {
+            _shadow.strokeColor = NULL;
+        }
     }
 
     CGFloat progress = IDClamp(_reveal.value, 0.0, 1.0);
