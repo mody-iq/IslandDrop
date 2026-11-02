@@ -34,7 +34,6 @@ static const CFTimeInterval kEnterRevealDelay = 0.560;
 static const CFTimeInterval kExitCollapseDelay = 0.100;
 static const CFTimeInterval kExitDropDelay = 0.280;
 static const CGFloat kExitVelocity = 2.0;
-static const float kGooK = 18.0f;
 static const float kGooColorK = 10.0f;
 
 static char kIDHideKey;
@@ -157,7 +156,33 @@ static IDGeo IDBuildGeo(CGFloat drop, CGFloat expand, IDLayout L) {
 }
 
 // ---------------------------------------------------------------- helpers
+static NSString *const kIDDomain = @"com.mody.islanddrop";
+
+static id IDPref(NSString *key) {
+    CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)kIDDomain);
+    return CFBridgingRelease(v);
+}
+
+static BOOL IDPrefBool(NSString *key, BOOL def) {
+    id v = IDPref(key);
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v boolValue];
+    return def;
+}
+
+static int IDPrefInt(NSString *key, int def) {
+    id v = IDPref(key);
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v intValue];
+    return def;
+}
+
+static double IDPrefDouble(NSString *key, double def) {
+    id v = IDPref(key);
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v doubleValue];
+    return def;
+}
+
 static BOOL IDEnabled(void) {
+    if (!IDPrefBool(@"enabled", YES)) return NO;
     return ![[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences/com.mody.islanddrop.disable"];
 }
 
@@ -240,6 +265,41 @@ static NSString *IDPickRow(NSMutableArray *rest) {
     }
     [rest removeObjectsInArray:taken];
     return best[@"t"];
+}
+
+// ---------------------------------------------------------------- accent color from icon
+static UIColor *IDAccentFromImage(UIImage *img) {
+    if (!img.CGImage) return nil;
+    const int N = 16;
+    uint8_t buf[N * N * 4];
+    memset(buf, 0, sizeof(buf));
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
+                                             (CGBitmapInfo)(kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big));
+    CGColorSpaceRelease(cs);
+    if (!ctx) return nil;
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), img.CGImage);
+    CGContextRelease(ctx);
+
+    double sr = 0.0, sg = 0.0, sb = 0.0, sw = 0.0;
+    for (int i = 0; i < N * N; i++) {
+        double a = buf[i * 4 + 3] / 255.0;
+        if (a < 0.5) continue;
+        double r = MIN(1.0, (buf[i * 4] / 255.0) / a);
+        double g = MIN(1.0, (buf[i * 4 + 1] / 255.0) / a);
+        double b = MIN(1.0, (buf[i * 4 + 2] / 255.0) / a);
+        double mx = MAX(r, MAX(g, b));
+        double mn = MIN(r, MIN(g, b));
+        double sat = (mx > 0.001) ? ((mx - mn) / mx) : 0.0;
+        double w = sat * sat * mx;
+        sr += r * w;
+        sg += g * w;
+        sb += b * w;
+        sw += w;
+    }
+    if (sw < 0.5) return nil;
+    return [UIColor colorWithRed:sr / sw green:sg / sw blue:sb / sw alpha:1.0];
 }
 
 // ---------------------------------------------------------------- dark / light detection
@@ -347,6 +407,11 @@ static CGColorSpaceRef gCS = NULL;
     CFTimeInterval _startTime, _lastTime, _exitTime;
     BOOL _exiting, _finished, _gotTitle, _dark;
     float _cardR, _cardG, _cardB;
+    double _tm;
+    float _gooK;
+    BOOL _glowOn;
+    UIColor *_accent;
+    CAShapeLayer *_glow;
     CGFloat _topSeen, _origAlpha;
     CADisplayLink *_link;
     IDOverlayWindow *_window;
@@ -395,22 +460,41 @@ static IDSession *gSession = nil;
     _topSeen = islandBottom + 16.0;
     _L.cardCenterY = _topSeen + kCardH / 2.0;
 
-    IDSpringInit(&_drop, 1150.0, 0.82);
-    IDSpringInit(&_expand, 1000.0, 0.8);
-    IDSpringInit(&_reveal, 700.0, 1.0);
-    IDSpringInit(&_tint, 700.0, 1.0);
+    // user settings (read fresh for every notification)
+    int speedMode = IDPrefInt(@"speed", 1);
+    _tm = (speedMode == 0) ? 1.35 : ((speedMode == 2) ? 0.72 : 1.0);
+    double goo = IDPrefDouble(@"goo", 0.62);
+    if (goo < 0.0) goo = 0.0;
+    if (goo > 1.0) goo = 1.0;
+    _gooK = (float)(8.0 + 16.0 * goo);
+    _glowOn = IDPrefBool(@"glow", NO);
+    int hapticMode = IDPrefInt(@"haptic", 1);
+    int cardMode = IDPrefInt(@"cardMode", 0);
+
+    IDSpringInit(&_drop, 1150.0 * _tm, 0.82);
+    IDSpringInit(&_expand, 1000.0 * _tm, 0.8);
+    IDSpringInit(&_reveal, 700.0 * _tm, 1.0);
+    IDSpringInit(&_tint, 700.0 * _tm, 1.0);
     _startTime = CACurrentMediaTime();
     _drop.target = 1.0;
     _drop.startAt = _startTime;
     _tint.target = 1.0;
-    _tint.startAt = _startTime + kEnterTintDelay;
+    _tint.startAt = _startTime + kEnterTintDelay * _tm;
     _expand.target = 1.0;
-    _expand.startAt = _startTime + kEnterExpandDelay;
+    _expand.startAt = _startTime + kEnterExpandDelay * _tm;
     _reveal.target = 1.0;
-    _reveal.startAt = _startTime + kEnterRevealDelay;
+    _reveal.startAt = _startTime + kEnterRevealDelay * _tm;
 
-    // dark / light detection (before our overlay is visible)
-    _dark = (IDDetectDark(screen) == 1);
+    // dark / light card (auto = measure the screen before our overlay is visible)
+    int dk = 0;
+    if (cardMode == 1) {
+        dk = 0;
+    } else if (cardMode == 2) {
+        dk = 1;
+    } else {
+        dk = IDDetectDark(screen);
+    }
+    _dark = (dk == 1);
     _cardR = _dark ? (28.0f / 255.0f) : 1.0f;
     _cardG = _dark ? (28.0f / 255.0f) : 1.0f;
     _cardB = _dark ? (30.0f / 255.0f) : 1.0f;
@@ -443,6 +527,16 @@ static IDSession *gSession = nil;
     _shadow.lineWidth = 1.0;
     _shadow.strokeColor = NULL;
     [_root.layer addSublayer:_shadow];
+
+    _glow = [CAShapeLayer layer];
+    _glow.frame = CGRectMake(0, 0, sb.size.width, sb.size.height);
+    _glow.fillColor = NULL;
+    _glow.strokeColor = NULL;
+    _glow.lineWidth = 2.0;
+    _glow.shadowOffset = CGSizeZero;
+    _glow.shadowRadius = 9.0;
+    _glow.shadowOpacity = 0.0;
+    [_root.layer addSublayer:_glow];
 
     _goo = [CALayer layer];
     _goo.contentsScale = _scale;
@@ -493,6 +587,15 @@ static IDSession *gSession = nil;
     [src setAlpha:_origAlpha];
 
     _window.hidden = NO;
+
+    if (hapticMode > 0) {
+        UIImpactFeedbackStyle style = (hapticMode == 2) ? UIImpactFeedbackStyleMedium : UIImpactFeedbackStyleLight;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kEnterExpandDelay * _tm * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            static UIImpactFeedbackGenerator *gHaptic = nil;
+            gHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:style];
+            [gHaptic impactOccurred];
+        });
+    }
 
     __weak IDSession *ws = self;
     double delays[3] = { 0.12, 0.40, 0.90 };
@@ -549,6 +652,7 @@ static IDSession *gSession = nil;
             CGFloat pp = p * k;
             _iconView.frame = CGRectMake(-pp, -pp, 46.0 + pp * 2.0, 46.0 * (sz.height / sz.width) + pp * 2.0);
             _iconView.image = img;
+            if (_glowOn) _accent = IDAccentFromImage(img);
         }
     }
 }
@@ -558,11 +662,11 @@ static IDSession *gSession = nil;
     _exiting = YES;
     CFTimeInterval now = CACurrentMediaTime();
     _exitTime = now;
-    IDSpringRetarget(&_reveal, 360.0, 1.0, 0.0, now);
-    IDSpringRetarget(&_expand, 660.0, 0.92, 0.0, now + kExitCollapseDelay);
+    IDSpringRetarget(&_reveal, 360.0 * _tm, 1.0, 0.0, now);
+    IDSpringRetarget(&_expand, 660.0 * _tm, 0.92, 0.0, now + kExitCollapseDelay * _tm);
     _expand.velocity = kExitVelocity;
-    IDSpringRetarget(&_tint, 1150.0, 0.9, 0.0, now + kExitDropDelay);
-    IDSpringRetarget(&_drop, 1150.0, 0.9, 0.0, now + kExitDropDelay);
+    IDSpringRetarget(&_tint, 1150.0 * _tm, 0.9, 0.0, now + kExitDropDelay * _tm);
+    IDSpringRetarget(&_drop, 1150.0 * _tm, 0.9, 0.0, now + kExitDropDelay * _tm);
 }
 
 - (void)finish {
@@ -623,7 +727,15 @@ static IDSession *gSession = nil;
     _shadow.path = cardPath.CGPath;
     _shadow.shadowPath = cardPath.CGPath;
     _shadow.shadowOpacity = (float)g.shadowOpacity;
-    if (_dark) {
+    BOOL glowing = (_glowOn && _accent != nil);
+    if (glowing) {
+        _glow.path = cardPath.CGPath;
+        _glow.shadowPath = cardPath.CGPath;
+        _glow.strokeColor = [_accent colorWithAlphaComponent:0.9 * g.shadowOpacity].CGColor;
+        _glow.shadowColor = _accent.CGColor;
+        _glow.shadowOpacity = (float)(0.65 * g.shadowOpacity);
+        _shadow.strokeColor = NULL;
+    } else if (_dark) {
         _shadow.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.16 * g.shadowOpacity].CGColor;
     }
 
@@ -647,7 +759,8 @@ static IDSession *gSession = nil;
 - (void)renderGoo:(IDGeo)g {
     const float S = (float)_scale;
     const float invS = 1.0f / S;
-    const float pad = kGooK + 3.0f;
+    const float gk = _gooK;
+    const float pad = gk + 3.0f;
 
     CGFloat leftEdge = MIN(_L.centerX - _L.islandW / 2.0, g.x);
     CGFloat rightEdge = MAX(_L.centerX + _L.islandW / 2.0, g.x + g.w);
@@ -704,10 +817,10 @@ static IDSession *gSession = nil;
             float dB = dI;
             if (hasNeck) {
                 const float dN = IDSdRoundRect(x, y, icx, ncy, nhw, nhh, nr);
-                dB = IDSmin(dI, dN, kGooK);
+                dB = IDSmin(dI, dN, gk);
             }
             const float dC = IDSdRoundRect(x, y, ccx, ccy, chw, chh, cr);
-            const float d = IDSmin(dB, dC, kGooK);
+            const float d = IDSmin(dB, dC, gk);
             float cov = 0.5f - d * S;
             if (cov <= 0.0f) continue;
             if (cov > 1.0f) cov = 1.0f;
