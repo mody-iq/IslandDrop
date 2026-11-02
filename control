@@ -1,0 +1,9 @@
+Package: com.mody.islanddrop
+Name: IslandDrop
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Dynamic Island style droplet notifications for all apps
+Maintainer: mody
+Author: mody
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 16.0)
