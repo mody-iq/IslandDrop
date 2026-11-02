@@ -9,6 +9,6 @@ TWEAK_NAME = IslandDrop
 
 IslandDrop_FILES = Tweak.xm
 IslandDrop_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
-IslandDrop_FRAMEWORKS = UIKit QuartzCore CoreGraphics
+IslandDrop_FRAMEWORKS = UIKit QuartzCore CoreGraphics IOSurface
 
 include $(THEOS_MAKE_PATH)/tweak.mk
